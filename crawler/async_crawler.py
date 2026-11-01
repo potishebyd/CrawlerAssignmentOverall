@@ -9,6 +9,8 @@ import ssl
 import aiohttp
 import certifi
 
+from crawler.html_parser import HTMLParser
+
 logger = logging.getLogger(__name__)
 
 _USER_AGENT = "AsyncCrawler/1.0 (crawler-assignment)"
@@ -28,6 +30,7 @@ class AsyncCrawler:
         connect_timeout: float = 10.0,
         read_timeout: float = 30.0,
         total_timeout: float | None = None,
+        same_host_only: bool = False,
     ) -> None:
         """Создаёт краулер.
 
@@ -41,6 +44,9 @@ class AsyncCrawler:
             остаются только таймауты соединения и чтения.
 
         HTTPS проверяется по списку центров сертификации из пакета ``certifi``.
+
+        :param same_host_only: при разборе HTML оставлять только ссылки
+            на хост загруженной страницы.
         """
         if max_concurrent < 1:
             raise ValueError("max_concurrent должен быть >= 1")
@@ -56,6 +62,7 @@ class AsyncCrawler:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session_lock = asyncio.Lock()
         self._session: aiohttp.ClientSession | None = None
+        self._parser = HTMLParser(same_host_only=same_host_only)
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         async with self._session_lock:
@@ -122,6 +129,27 @@ class AsyncCrawler:
         """
         pages = await asyncio.gather(*(self.fetch_url(url) for url in urls))
         return dict(zip(urls, pages, strict=True))
+
+    async def fetch_and_parse(self, url: str) -> dict:
+        """Загружает страницу и возвращает разобранные данные.
+
+        В словаре есть исходный адрес, заголовок, текст, абсолютные ссылки
+        и метаданные. Изображения, заголовки, таблицы и списки добавляются
+        рядом. Ошибка загрузки или разбора оставляет поля пустыми.
+        """
+        html = await self.fetch_url(url)
+        parsed = await self._parser.parse_html(html, url)
+        return {
+            "url": url,
+            "title": parsed["title"],
+            "text": parsed["text"],
+            "links": parsed["links"],
+            "metadata": parsed["metadata"],
+            "images": parsed["images"],
+            "headings": parsed["headings"],
+            "tables": parsed["tables"],
+            "lists": parsed["lists"],
+        }
 
     async def close(self) -> None:
         """Закрывает сессию и возвращает соединения в операционную систему."""

@@ -92,7 +92,8 @@ async def _start_server() -> tuple[web.AppRunner, str, dict[str, int]]:
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    return runner, site.name.rstrip("/"), state
+    host, port = runner.addresses[0][:2]
+    return runner, f"http://{host}:{port}", state
 
 
 async def demo_public() -> None:

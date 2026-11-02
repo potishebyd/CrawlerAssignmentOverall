@@ -12,10 +12,12 @@ from urllib.parse import urlsplit
 import aiohttp
 import certifi
 
+from crawler.errors import CrawlerError, NetworkError, ParseError, TransientError
 from crawler.html_parser import HTMLParser
 from crawler.limits import SemaphoreManager
 from crawler.queue import CrawlerQueue, normalize_url
 from crawler.rate_limiter import RateLimiter
+from crawler.retry import CircuitBreaker, RetryStrategy, classify_http_status, current_attempt
 from crawler.robots import RobotsParser
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,8 @@ class AsyncCrawler:
         user_agents: list[str] | None = None,
         backoff_base: float = 0.5,
         backoff_max: float = 8.0,
+        retry_strategy: RetryStrategy | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> None:
         """Создаёт краулер.
 
@@ -77,8 +81,15 @@ class AsyncCrawler:
         :param jitter: случайная добавка к паузе от 0 до этого значения, секунды.
         :param user_agent: значение заголовка User-Agent.
         :param user_agents: список для поочерёдной подмены User-Agent.
-        :param backoff_base: первая пауза после ошибки, дальше она удваивается.
+        :param backoff_base: первая пауза после окончательной ошибки домена,
+            дальше она удваивается. Повторы одного адреса ждут отдельно,
+            по правилам ``retry_strategy``.
         :param backoff_max: потолок паузы после ошибок, секунды.
+        :param retry_strategy: правила повторов. По умолчанию повторов нет,
+            чтобы один сбой не запускал серию запросов. Класс ``RetryStrategy``
+            сам по себе повторяет временные ошибки до трёх раз.
+        :param circuit_breaker: закрывает домен после серии временных ошибок.
+            По умолчанию порог пять ошибок и пауза 30 секунд.
         """
         if max_concurrent < 1:
             raise ValueError("max_concurrent должен быть >= 1")
@@ -135,6 +146,8 @@ class AsyncCrawler:
             jitter=jitter,
         )
         self._robots = RobotsParser(self._download_robots)
+        self.retry_strategy = retry_strategy or RetryStrategy(max_retries=0)
+        self.circuit_breaker = circuit_breaker or CircuitBreaker()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         async with self._session_lock:
@@ -159,9 +172,9 @@ class AsyncCrawler:
     async def fetch_url(self, url: str) -> str:
         """Загружает одну страницу и возвращает её текст.
 
-        Перед запросом проверяет robots.txt, если это включено, и ждёт
-        разрешение ограничителя скорости. При ошибке или запрете возвращает
-        пустую строку и пишет причину в лог.
+        Перед запросом проверяет robots.txt, если это включено. Временные
+        и сетевые ошибки повторяет стратегия ``retry_strategy``. При окончательной
+        ошибке или запрете возвращает пустую строку и пишет причину в лог.
         """
         user_agent = self._next_user_agent()
         crawl_delay = 0.0
@@ -182,49 +195,78 @@ class AsyncCrawler:
                 return ""
             crawl_delay = self._robots.get_crawl_delay(user_agent, url)
 
+        try:
+            return await self.retry_strategy.execute_with_retry(
+                self._fetch_attempt,
+                url,
+                user_agent,
+                crawl_delay,
+            )
+        except CrawlerError as exc:
+            self._note_failure(url)
+            self._block_reasons[url] = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "Итог загрузки %s: неудача, %s, попыток %d",
+                url,
+                type(exc).__name__,
+                exc.attempts,
+            )
+            return ""
+
+    async def _fetch_attempt(self, url: str, user_agent: str, crawl_delay: float) -> str:
+        """Одна попытка загрузки. Ошибки поднимает, а не прячет."""
         domain = _domain_of(url)
+        service = _service_of(url)
+        await self.circuit_breaker.check(service, url)
         extra = max(crawl_delay, self._backoff_delay(domain))
         await self._rate_limiter.acquire(domain, extra_delay=extra)
         session = await self._ensure_session()
-        async with self._limits.limit(url):
-            return await self._fetch(session, url, user_agent)
-
-    async def _fetch(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        user_agent: str,
-    ) -> str:
-        logger.info("Начало загрузки URL: %s", url)
+        timeout = self._timeout_for(current_attempt())
         try:
-            async with session.get(url, headers={"User-Agent": user_agent}) as response:
-                response.raise_for_status()
-                text = await response.text(errors="replace")
+            async with self._limits.limit(url):
+                logger.info("Начало загрузки URL: %s (попытка %d)", url, current_attempt())
+                async with session.get(
+                    url,
+                    headers={"User-Agent": user_agent},
+                    timeout=timeout,
+                ) as response:
+                    if response.status >= 400:
+                        await response.read()
+                        raise classify_http_status(response.status, url)
+                    text = await response.text(errors="replace")
+        except CrawlerError as exc:
+            await self._observe_failure(service, exc)
+            raise
         except (TimeoutError, asyncio.TimeoutError) as exc:
-            self._note_failure(url)
-            logger.warning("Таймаут при загрузке URL %s: %s", url, type(exc).__name__)
-            return ""
+            error = TransientError("таймаут", url=url)
+            await self._observe_failure(service, error)
+            raise error from exc
         except aiohttp.ClientResponseError as exc:
-            self._note_failure(url)
-            logger.warning(
-                "HTTP-ошибка при загрузке URL %s: %s (status=%s)",
-                url,
-                type(exc).__name__,
-                exc.status,
-            )
-            return ""
+            error = classify_http_status(exc.status or 0, url)
+            await self._observe_failure(service, error)
+            raise error from exc
         except aiohttp.ClientError as exc:
-            self._note_failure(url)
-            logger.warning(
-                "Сетевая ошибка при загрузке URL %s: %s",
-                url,
-                type(exc).__name__,
-            )
-            return ""
+            error = NetworkError(type(exc).__name__, url=url)
+            await self._observe_failure(service, error)
+            raise error from exc
 
         self._note_success(url)
+        await self.circuit_breaker.record_success(service)
         logger.info("Успешное завершение: %s (%d символов)", url, len(text))
         return text
+
+    def _timeout_for(self, attempt: int) -> aiohttp.ClientTimeout:
+        scale = self.retry_strategy.timeout_scale(attempt)
+        total = None if self._total_timeout is None else self._total_timeout * scale
+        return aiohttp.ClientTimeout(
+            total=total,
+            connect=self._connect_timeout * scale,
+            sock_read=self._read_timeout * scale,
+        )
+
+    async def _observe_failure(self, service: str, exc: CrawlerError) -> None:
+        if isinstance(exc, (TransientError, NetworkError)):
+            await self.circuit_breaker.record_failure(service)
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
         """Параллельно загружает страницы и возвращает словарь URL → текст.
@@ -288,6 +330,7 @@ class AsyncCrawler:
         self.robots_blocked_urls = []
         self._block_reasons = {}
         self._rate_limiter.reset_stats()
+        self.retry_strategy.reset_stats()
 
         for url in start_urls:
             normalized = normalize_url(url)
@@ -340,7 +383,15 @@ class AsyncCrawler:
             self._report_progress()
             return
 
-        parsed = await self._parser.parse_html(html, url)
+        try:
+            parsed = await self._parser.parse_html(html, url)
+        except Exception as exc:
+            error = ParseError(type(exc).__name__, url=url)
+            self.retry_strategy.record_terminal(error)
+            reason = f"ParseError: {error}"
+            self._queue.mark_failed(url, reason)
+            self._report_progress()
+            return
         parsed["depth"] = depth
         self._enqueue_links(parsed.get("links", []), depth)
         self.processed_urls[url] = parsed
@@ -406,6 +457,10 @@ class AsyncCrawler:
         await self.close()
 
 
+    def error_stats(self) -> dict:
+        """Ошибки по классам, удачные повторы, средняя пауза и постоянные адреса."""
+        return self.retry_strategy.stats()
+
     def politeness_stats(self) -> dict:
         """Скорость запросов, средняя пауза и число адресов, закрытых robots.txt."""
         stats = self._rate_limiter.get_stats()
@@ -455,6 +510,11 @@ class AsyncCrawler:
 def _domain_of(url: str) -> str:
     parts = urlsplit(url)
     return (parts.hostname or parts.netloc or "*").lower()
+
+
+def _service_of(url: str) -> str:
+    parts = urlsplit(url)
+    return (parts.netloc or "*").lower()
 
 
 def _is_robots_txt(url: str) -> bool:

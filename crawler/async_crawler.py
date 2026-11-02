@@ -19,6 +19,7 @@ from crawler.queue import CrawlerQueue, normalize_url
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import CircuitBreaker, RetryStrategy, classify_http_status, current_attempt
 from crawler.robots import RobotsParser
+from crawler.storage import DataStorage, build_record
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class AsyncCrawler:
         backoff_max: float = 8.0,
         retry_strategy: RetryStrategy | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        storage: DataStorage | None = None,
     ) -> None:
         """Создаёт краулер.
 
@@ -90,6 +92,8 @@ class AsyncCrawler:
             сам по себе повторяет временные ошибки до трёх раз.
         :param circuit_breaker: закрывает домен после серии временных ошибок.
             По умолчанию порог пять ошибок и пауза 30 секунд.
+        :param storage: куда складывать разобранные страницы. ``None`` ничего
+            не пишет. Ошибка записи логируется и не останавливает обход.
         """
         if max_concurrent < 1:
             raise ValueError("max_concurrent должен быть >= 1")
@@ -148,6 +152,8 @@ class AsyncCrawler:
         self._robots = RobotsParser(self._download_robots)
         self.retry_strategy = retry_strategy or RetryStrategy(max_retries=0)
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
+        self.storage = storage
+        self._page_meta: dict[str, dict] = {}
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         async with self._session_lock:
@@ -234,6 +240,10 @@ class AsyncCrawler:
                         await response.read()
                         raise classify_http_status(response.status, url)
                     text = await response.text(errors="replace")
+                    self._page_meta[url] = {
+                        "status_code": response.status,
+                        "content_type": response.content_type or "",
+                    }
         except CrawlerError as exc:
             await self._observe_failure(service, exc)
             raise
@@ -329,6 +339,7 @@ class AsyncCrawler:
         self.robots_blocked = 0
         self.robots_blocked_urls = []
         self._block_reasons = {}
+        self._page_meta = {}
         self._rate_limiter.reset_stats()
         self.retry_strategy.reset_stats()
 
@@ -351,6 +362,19 @@ class AsyncCrawler:
                 if not worker.done():
                     worker.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+
+        if self.storage is not None:
+            try:
+                await self.storage.flush()
+            except Exception as exc:
+                logger.warning("Сброс хранилища не удался: %s", type(exc).__name__)
+            stats = self.storage.stats()
+            logger.info(
+                "Хранилище: сохранено %d, ошибок записи %d, пачек %d",
+                stats["saved"],
+                stats["errors"],
+                stats["batches"],
+            )
 
         logger.info(
             "Обход завершён: обработано %d, ошибок %d, в множестве visited %d",
@@ -395,6 +419,7 @@ class AsyncCrawler:
         parsed["depth"] = depth
         self._enqueue_links(parsed.get("links", []), depth)
         self.processed_urls[url] = parsed
+        await self._store_page(parsed)
         self._queue.mark_processed(url)
         self._report_progress()
 
@@ -441,13 +466,36 @@ class AsyncCrawler:
             polite["blocked_by_robots"],
         )
 
+    async def _store_page(self, parsed: dict) -> None:
+        if self.storage is None:
+            return
+        meta = self._page_meta.pop(parsed.get("url", ""), {})
+        record = build_record(
+            parsed,
+            status_code=meta.get("status_code", 0),
+            content_type=meta.get("content_type", ""),
+        )
+        try:
+            await self.storage.save(record)
+        except Exception as exc:
+            logger.warning(
+                "Сохранение %s не остановило обход: %s",
+                record["url"],
+                type(exc).__name__,
+            )
+
     async def close(self) -> None:
-        """Закрывает сессию и возвращает соединения в операционную систему."""
+        """Закрывает сессию и сбрасывает хранилище, если оно подключено."""
         async with self._session_lock:
             session = self._session
             self._session = None
         if session is not None and not session.closed:
             await session.close()
+        if self.storage is not None:
+            try:
+                await self.storage.close()
+            except Exception as exc:
+                logger.warning("Закрытие хранилища не удалось: %s", type(exc).__name__)
 
     async def __aenter__(self) -> AsyncCrawler:
         await self._ensure_session()

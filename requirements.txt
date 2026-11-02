@@ -1,5 +1,6 @@
 aiohttp>=3.10,<4
 aiofiles>=24
+aiosqlite>=0.20
 certifi>=2024.8.30
 beautifulsoup4>=4.12
 lxml>=5

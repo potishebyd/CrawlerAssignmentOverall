@@ -61,3 +61,85 @@
 
 ---
 Удачи с реализацией! 🚀
+
+## Как пользоваться
+
+Установка зависимостей и запуск из корня проекта:
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python demo_day7.py
+```
+
+Демонстрации дней 1–6 запускаются так же: `demo_day1.py` … `demo_day6.py`. Каждая печатает `OK` или `НЕТ` по своим проверкам. Сервер в демонстрациях поднимается на `127.0.0.1` и случайном порту.
+
+Командная строка:
+
+```bash
+python crawler.py --urls https://example.com --max-pages 100 --output results.json
+python crawler.py --config config.example.yaml
+python -m crawler --help
+```
+
+Параметры `--urls`, `--max-pages`, `--max-depth`, `--output`, `--config`, `--respect-robots` и `--rate-limit` перекрывают одноимённые поля файла. `--output` — это файл страниц: `.json`, `.csv`, `.db` или `.sqlite`. Сводка в JSON и HTML пишется отдельно, методами `export_to_json` и `export_to_html_report`, чтобы не затереть страницы.
+
+Пример из кода:
+
+```python
+import asyncio
+from crawler import AdvancedCrawler
+
+async def main():
+    crawler = AdvancedCrawler.from_config("config.yaml")
+    await crawler.crawl()
+    stats = crawler.get_stats()
+    print(f"Обработано: {stats['total_pages']} страниц")
+    print(f"Успешно: {stats['successful']}")
+    print(f"Ошибок: {stats['failed']}")
+    crawler.export_to_html_report("report.html")
+    await crawler.close()
+
+asyncio.run(main())
+```
+
+`config.example.yaml` показывает поля файла. Его `start_urls` указывает на example.com, для проверки без внешней сети удобнее свой YAML, как в `demo_day7.py`.
+
+### Конфигурация
+
+Файл `.yaml`, `.yml` или `.json`.
+
+| Поле | Смысл |
+| --- | --- |
+| `start_urls` | Стартовые адреса |
+| `max_pages`, `max_depth`, `max_concurrent` | Предел страниц, глубина ссылок, одновременные запросы |
+| `requests_per_second` или `rate_limit` | Запросов в секунду. Пустое значение снимает предел |
+| `min_delay` | Минимальная пауза между запросами к домену |
+| `respect_robots` | Читать robots.txt и не ходить в Disallow |
+| `same_domain_only` | Не переходить на другие хосты |
+| `use_sitemap` | Добавить адреса из sitemap. Если `sitemaps` пуст, берётся `/sitemap.xml` каждого стартового сайта |
+| `exclude_patterns`, `include_patterns` | Регулярные выражения для найденных ссылок |
+| `output` и `storage.format` | Куда писать страницы: json, csv или sqlite |
+| `storage.batch_size` | Размер пачки записи |
+| `log_file`, `log_level` | Файл журнала и уровень DEBUG, INFO, WARNING или ERROR |
+| `show_progress` | Строка прогресса в stderr: процент, стр/с, ETA, активные задачи |
+| `user_agent` | Строка User-Agent |
+
+Журнал пишется в консоль и в файл. У файла ротация: по умолчанию около 1 МБ и три запасные копии. В строке есть время и уровень.
+
+### Что делает AdvancedCrawler
+
+`AdvancedCrawler` собирает загрузчик, очередь, разбор HTML, robots.txt, ограничение скорости, повторы, хранилище, карту сайта и сводку.
+
+- `from_config(path)` и `from_dict(data)` собирают краулер из настроек.
+- `crawl()` обходит стартовые адреса. При `use_sitemap=True` сначала читает индекс и вложенные sitemap.
+- `get_stats()` возвращает `total_pages`, `successful`, `failed`, `pages_per_second`, `elapsed_seconds`, `status_codes`, `top_domains`, `robots_blocked`.
+- `export_to_json(filename)` пишет эту сводку.
+- `export_to_html_report(filename)` пишет одну HTML-страницу: карточки, полоски по кодам ответа, домены и таблицу страниц.
+- `close()` закрывает HTTP-сессию и хранилище.
+
+`SitemapParser.fetch_sitemap(url)` возвращает список адресов страниц. Индекс sitemap раскрывается рекурсивно. Повтор того же файла не зацикливается. Битый XML и ответ с ошибкой дают пустой список.
+
+`AsyncCrawler` по-прежнему работает сам по себе: без sitemap, без обязательного файла и без строки прогресса. Эти части включаются через `AdvancedCrawler`.
+
+Прокси, cookies, выполнение JavaScript и распределённый обход несколькими машинами в этот проект не входят.

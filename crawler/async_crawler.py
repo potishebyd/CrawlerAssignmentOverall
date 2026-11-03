@@ -154,6 +154,8 @@ class AsyncCrawler:
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.storage = storage
         self._page_meta: dict[str, dict] = {}
+        self.on_progress = None
+        self._max_pages = 0
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         async with self._session_lock:
@@ -340,6 +342,7 @@ class AsyncCrawler:
         self.robots_blocked_urls = []
         self._block_reasons = {}
         self._page_meta = {}
+        self._max_pages = max_pages
         self._rate_limiter.reset_stats()
         self.retry_strategy.reset_stats()
 
@@ -465,15 +468,36 @@ class AsyncCrawler:
             polite["average_delay"],
             polite["blocked_by_robots"],
         )
+        if self.on_progress is None:
+            return
+        try:
+            limits = self._limits.get_stats()
+            self.on_progress(
+                {
+                    "processed": stats["processed"],
+                    "failed": stats["failed"],
+                    "pending": stats["pending"],
+                    "in_progress": stats["in_progress"],
+                    "active_requests": limits["active"],
+                    "max_pages": self._max_pages,
+                    "elapsed": elapsed,
+                    "pages_per_second": speed,
+                }
+            )
+        except Exception as exc:
+            logger.warning("Сбой вывода прогресса: %s", type(exc).__name__)
 
     async def _store_page(self, parsed: dict) -> None:
+        meta = self._page_meta.pop(parsed.get("url", ""), {})
+        if meta:
+            parsed["status_code"] = meta.get("status_code", 0)
+            parsed["content_type"] = meta.get("content_type", "")
         if self.storage is None:
             return
-        meta = self._page_meta.pop(parsed.get("url", ""), {})
         record = build_record(
             parsed,
-            status_code=meta.get("status_code", 0),
-            content_type=meta.get("content_type", ""),
+            status_code=int(parsed.get("status_code") or 0),
+            content_type=str(parsed.get("content_type") or ""),
         )
         try:
             await self.storage.save(record)

@@ -16,13 +16,18 @@ from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import CircuitBreaker, RetryStrategy
 from crawler.robots import RobotsParser
+from crawler.advanced import AdvancedCrawler
+from crawler.sitemap import SitemapParser
+from crawler.stats import CrawlerStats
 from crawler.storage import CSVStorage, DataStorage, JSONStorage, SQLiteStorage
 
 __all__ = [
+    "AdvancedCrawler",
     "AsyncCrawler",
     "CircuitBreaker",
     "CircuitOpenError",
     "CrawlerError",
+    "CrawlerStats",
     "CSVStorage",
     "CrawlerQueue",
     "DataStorage",
@@ -36,6 +41,7 @@ __all__ = [
     "RobotsParser",
     "SQLiteStorage",
     "SemaphoreManager",
+    "SitemapParser",
     "TransientError",
     "classify_http_status",
 ]

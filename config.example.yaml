@@ -1,0 +1,21 @@
+# Пример настроек. Запуск: python crawler.py --config config.example.yaml
+start_urls:
+  - https://example.com
+max_pages: 20
+max_depth: 1
+max_concurrent: 5
+requests_per_second: 2
+respect_robots: true
+same_domain_only: true
+use_sitemap: false
+exclude_patterns: []
+include_patterns: []
+user_agent: AdvancedCrawler/1.0
+output: output/day7/results.json
+storage:
+  format: json
+  batch_size: 10
+log_file: output/day7/crawler.log
+log_level: INFO
+show_progress: true
+min_delay: 0

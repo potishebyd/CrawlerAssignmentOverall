@@ -22,6 +22,8 @@ from crawler import AdvancedCrawler, SitemapParser
 from crawler.logconfig import setup_logging
 
 ROOT = Path("output/day7")
+_flaky_hits = {"n": 0}
+_status_hits = {"500": 0}
 
 
 def _section(title: str) -> None:
@@ -84,6 +86,14 @@ async def _start_server() -> tuple[web.AppRunner, str]:
             return web.Response(text=_html("Скрытая", []), content_type="text/html")
         if path == "/linked":
             return web.Response(text=_html("Ссылка", []), content_type="text/html")
+        if path == "/flaky":
+            _flaky_hits["n"] += 1
+            if _flaky_hits["n"] < 3:
+                return web.Response(status=503, text="busy")
+            return web.Response(text=_html("Готово", []), content_type="text/html")
+        if path == "/error500":
+            _status_hits["500"] += 1
+            return web.Response(status=500, text="fail")
         if path.startswith("/slow/") or path.startswith("/fast/"):
             if path.startswith("/slow/"):
                 await asyncio.sleep(0.05)
@@ -210,6 +220,84 @@ def demo_logging() -> None:
     print(
         "Файл журнала порезан, в строке есть время и уровень: "
         f"{_mark(backup.exists() and '[WARNING]' in combined and combined[:4].isdigit())}"
+    )
+
+
+async def demo_retries(origin: str) -> None:
+    _section("Повторы таймаутов и временных кодов")
+    plain = AdvancedCrawler(
+        [f"{origin}/"],
+        max_pages=1,
+        max_depth=0,
+        show_progress=False,
+        log_level="ERROR",
+    )
+    await plain.close()
+    config_path = ROOT / "retry.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "start_urls:",
+                f"  - {origin}/",
+                "max_pages: 1",
+                "max_depth: 0",
+                "max_retries: 2",
+                "retry:",
+                "  base_delay: 0.01",
+                "  backoff_factor: 2",
+                "log_level: ERROR",
+                "show_progress: false",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    configured = AdvancedCrawler.from_config(config_path)
+    await configured.close()
+
+    _flaky_hits["n"] = 0
+    recovered = AdvancedCrawler(
+        [f"{origin}/flaky"],
+        max_pages=1,
+        max_depth=0,
+        max_retries=3,
+        retry_base_delay=0.01,
+        respect_robots=False,
+        show_progress=False,
+        log_level="ERROR",
+    )
+    try:
+        pages = await recovered.crawl()
+        recovered_stats = recovered.crawler.retry_strategy.stats()
+    finally:
+        await recovered.close()
+
+    _status_hits["500"] = 0
+    failing = AdvancedCrawler(
+        [f"{origin}/error500"],
+        max_pages=1,
+        max_depth=0,
+        max_retries=3,
+        retry_base_delay=0.01,
+        respect_robots=False,
+        show_progress=False,
+        log_level="ERROR",
+    )
+    try:
+        failed_pages = await failing.crawl()
+        failed_stats = failing.get_stats()
+    finally:
+        await failing.close()
+
+    print(
+        f"По умолчанию повторов: {plain.crawler.retry_strategy.max_retries}, "
+        f"в конфиге: {configured.crawler.retry_strategy.max_retries}"
+    )
+    print(f"503 ответов до успеха: {_flaky_hits['n']}, успешных повторов: {recovered_stats['successful_retries']}")
+    print(f"Ответов 500: {_status_hits['500']}, ошибок в сводке: {failed_stats['failed']}")
+    print(
+        "Временный 503 повторён и страница получена, постоянный 500 повторён один раз: "
+        f"{_mark(plain.crawler.retry_strategy.max_retries == 3 and configured.crawler.retry_strategy.max_retries == 2 and f'{origin}/flaky' in pages and _flaky_hits['n'] == 3 and recovered_stats['successful_retries'] == 1 and not failed_pages and _status_hits['500'] == 2 and failed_stats['failed'] == 1)}"
     )
 
 
@@ -346,6 +434,7 @@ async def main() -> None:
     try:
         await demo_sitemap(origin)
         await demo_config(origin)
+        await demo_retries(origin)
         demo_logging()
         await demo_cli(origin)
         await demo_performance(origin)

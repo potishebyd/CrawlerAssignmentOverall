@@ -34,6 +34,9 @@ def config_to_kwargs(data: dict) -> dict:
         storage_cfg = {}
     output = data.get("output") or storage_cfg.get("path")
     rate = data.get("requests_per_second", data.get("rate_limit"))
+    retry_cfg = data.get("retry") or {}
+    if not isinstance(retry_cfg, dict):
+        retry_cfg = {}
     return {
         "start_urls": [str(url) for url in start_urls],
         "max_pages": int(data.get("max_pages", 100)),
@@ -54,4 +57,10 @@ def config_to_kwargs(data: dict) -> dict:
         "log_level": str(data.get("log_level", "INFO")),
         "show_progress": bool(data.get("show_progress", True)),
         "min_delay": float(data.get("min_delay", 0.0)),
+        "max_retries": int(data.get("max_retries", retry_cfg.get("max_retries", 3))),
+        "retry_base_delay": float(data.get("retry_base_delay", retry_cfg.get("base_delay", 0.25))),
+        "retry_backoff_factor": float(
+            data.get("retry_backoff_factor", retry_cfg.get("backoff_factor", 2.0))
+        ),
+        "retry_max_delay": float(data.get("retry_max_delay", retry_cfg.get("max_delay", 30.0))),
     }

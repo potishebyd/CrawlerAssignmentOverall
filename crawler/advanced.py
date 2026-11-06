@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from crawler.async_crawler import AsyncCrawler
 from crawler.config import config_to_kwargs, load_config
 from crawler.logconfig import setup_logging
+from crawler.retry import RetryStrategy
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
 from crawler.storage import CSVStorage, JSONStorage, SQLiteStorage
@@ -54,6 +55,10 @@ class AdvancedCrawler:
         log_level: str = "INFO",
         show_progress: bool = True,
         min_delay: float = 0.0,
+        max_retries: int = 3,
+        retry_base_delay: float = 0.25,
+        retry_backoff_factor: float = 2.0,
+        retry_max_delay: float = 30.0,
     ) -> None:
         if not start_urls:
             raise ValueError("Нужен хотя бы один стартовый URL")
@@ -83,6 +88,12 @@ class AdvancedCrawler:
             user_agent=user_agent or "AdvancedCrawler/1.0",
             storage=storage,
             backoff_base=0,
+            retry_strategy=RetryStrategy(
+                max_retries=max_retries,
+                backoff_factor=retry_backoff_factor,
+                base_delay=retry_base_delay,
+                max_delay=retry_max_delay,
+            ),
         )
         self.crawler.on_progress = self._on_progress if show_progress else None
         self.sitemap = SitemapParser(self._download)

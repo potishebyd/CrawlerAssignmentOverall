@@ -19,3 +19,8 @@ log_file: output/day7/crawler.log
 log_level: INFO
 show_progress: true
 min_delay: 0
+max_retries: 3
+retry:
+  base_delay: 0.25
+  backoff_factor: 2
+  max_delay: 30
